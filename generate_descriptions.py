@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 # ──────────────────── Configuration ────────────────────
 MODEL = "qwen-vl-max"            # best quality; switch to qwen-vl-plus for lower cost
+MODEL_FALLBACK = ["qwen-vl-max", "qwen-vl-plus", "qwen-vl-turbo"]  # auto-degrade on quota exhaustion
 MVTEC_ROOT = os.environ.get("MVTEC_ROOT", "./MVTec")
 OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "./mvtec_descriptions.json")
 PROMPT_FILE = os.environ.get("PROMPT_FILE",
@@ -36,6 +37,13 @@ PROMPT_FILE = os.environ.get("PROMPT_FILE",
 MAX_RETRIES = 3
 RETRY_DELAY = 5          # seconds between retries
 BATCH_SAVE_INTERVAL = 50  # save progress every N images
+
+# DashScope error codes that indicate quota/balance exhaustion —
+# retrying the same model won't help, so we fall back to the next model.
+_QUOTA_ERROR_CODES = {
+    "Arrearage", "Throttling.RateQuota", "Throttling.AllocationQuota",
+    "QuotaExceeded", "ResourceExhausted",
+}
 
 # ──────────────────── Helpers ──────────────────────────
 
@@ -52,6 +60,9 @@ def load_prompt(path: str) -> str:
 def call_vlm(image_path: str, prompt_text: str,
              cat_name: str = "", dtype_name: str = "") -> str:
     """Call Qwen-VL via DashScope native SDK and return the description string.
+
+    Automatically falls back to cheaper models (qwen-vl-plus → qwen-vl-turbo)
+    when the current model hits quota or balance errors.
 
     Parameters
     ----------
@@ -73,29 +84,44 @@ def call_vlm(image_path: str, prompt_text: str,
         meta_text = "Known metadata (use these exact labels when consistent with the image): " + "; ".join(meta_parts)
         user_content.append({"text": meta_text})
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = MultiModalConversation.call(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": [{"text": prompt_text}]},
-                    {
-                        "role": "user",
-                        "content": user_content,
-                    },
-                ],
-            )
-            if resp.status_code == 200:
-                return resp.output.choices[0].message.content[0]["text"].strip()
-            else:
-                raise RuntimeError(
-                    f"DashScope error {resp.status_code}: {resp.code} - {resp.message}"
+    last_error = None
+    for model_idx, model_name in enumerate(MODEL_FALLBACK):
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = MultiModalConversation.call(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": [{"text": prompt_text}]},
+                        {
+                            "role": "user",
+                            "content": user_content,
+                        },
+                    ],
                 )
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY * (attempt + 1))
-            else:
-                raise RuntimeError(f"Failed after {MAX_RETRIES} attempts: {e}") from e
+                if resp.status_code == 200:
+                    return resp.output.choices[0].message.content[0]["text"].strip()
+                else:
+                    raise RuntimeError(
+                        f"DashScope error {resp.status_code}: {resp.code} - {resp.message}"
+                    )
+            except Exception as e:
+                last_error = e
+                # Extract error code for quota detection
+                code = ""
+                try:
+                    code = resp.code
+                except (NameError, AttributeError):
+                    pass
+                # Quota exhausted → don't retry this model, fall back
+                if code in _QUOTA_ERROR_CODES:
+                    tqdm.write(f"  [quota] {model_name} exhausted, falling back...")
+                    break
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+
+    raise RuntimeError(
+        f"Failed after all models {MODEL_FALLBACK}: {last_error}"
+    ) from last_error
 
 
 # ──────────────────── Resume support ──────────────────
