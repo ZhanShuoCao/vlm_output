@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'feat: VLM-enhanced AGO prompt optimization for MVTec AD *)",
+      "Bash(git remote *)",
+      "Bash(git push *)",
+      "Bash(git -c http.proxy= -c https.proxy= push -u origin main)",
+      "Bash(git commit *)",
+      "Bash(git -c http.proxy= -c https.proxy= push)"
+    ]
+  }
+}

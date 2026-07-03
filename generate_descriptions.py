@@ -5,9 +5,10 @@ Use Qwen-VL (DashScope API) to generate per-image visual descriptions
 for MVTec AD defect images, output a COCO-style JSON annotation file.
 
 Usage:
-    # Step 1: Set API key as environment variable
-    set DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    # (or in PowerShell: $env:DASHSCOPE_API_KEY="sk-xxx...")
+    # Step 1: Set environment variables
+    export DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    export MVTEC_ROOT=/path/to/MVTec          # default: ./MVTec
+    export OUTPUT_FILE=./mvtec_descriptions.json  # default
 
     # Step 2: Run
     python generate_descriptions.py
@@ -27,9 +28,10 @@ from tqdm import tqdm
 
 # ──────────────────── Configuration ────────────────────
 MODEL = "qwen-vl-max"            # best quality; switch to qwen-vl-plus for lower cost
-MVTEC_ROOT = r"D:\Novels_Code\open_datasets\MVTec"
-OUTPUT_FILE = r"D:\Desktop\1\mvtec_layout_guided_defect_generation\datasets\mvtec_descriptions.json"
-PROMPT_FILE = r"D:\Desktop\1\mvtec_layout_guided_defect_generation\datasets\vlm_prompt.txt"
+MVTEC_ROOT = os.environ.get("MVTEC_ROOT", "./MVTec")
+OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "./mvtec_descriptions.json")
+PROMPT_FILE = os.environ.get("PROMPT_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_prompt_mvtec_ago_template.txt"))
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5          # seconds between retries
