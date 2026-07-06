@@ -1,14 +1,17 @@
 """
 generate_descriptions.py
 ========================
-Use Qwen-VL (DashScope API) to generate per-image visual descriptions
-for MVTec AD defect images, output a COCO-style JSON annotation file.
+Use Qwen-VL via 阿里云百炼 OpenAI-compatible API to generate per-image visual
+descriptions for MVTec AD defect images, output a COCO-style JSON annotation file.
+
+Prerequisites:
+    pip install openai tqdm
 
 Usage:
     # Step 1: Set environment variables
-    export DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-    export MVTEC_ROOT=/path/to/MVTec          # default: ./MVTec
-    export OUTPUT_FILE=./mvtec_descriptions.json  # default
+    set DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    set MVTEC_ROOT=D:\path\to\MVTec
+    set OUTPUT_FILE=./mvtec_descriptions.json
 
     # Step 2: Run
     python generate_descriptions.py
@@ -22,28 +25,48 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-import dashscope
-from dashscope import MultiModalConversation
+from openai import OpenAI
 from tqdm import tqdm
 
 # ──────────────────── Configuration ────────────────────
-MODEL = "qwen-vl-max"            # best quality; switch to qwen-vl-plus for lower cost
-MODEL_FALLBACK = ["qwen-vl-max", "qwen-vl-plus", "qwen-vl-turbo"]  # auto-degrade on quota exhaustion
-MVTEC_ROOT = os.environ.get("MVTEC_ROOT", "./MVTec")
+# 百炼 OpenAI-compatible endpoint
+BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# Model fallback chain — uses 百炼 models covered by free quota
+MODEL_FALLBACK = [
+    "qwen-vl-max",      # Qwen2.5-VL-72B, best quality
+    "qwen-vl-plus",     # Qwen2.5-VL-7B, lighter/cheaper
+]
+
+MVTEC_ROOT = os.environ.get("MVTEC_ROOT", r"D:\Desktop\MVTec")
 OUTPUT_FILE = os.environ.get("OUTPUT_FILE", "./mvtec_descriptions.json")
-PROMPT_FILE = os.environ.get("PROMPT_FILE",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_prompt_mvtec_ago_template.txt"))
+PROMPT_FILE = os.environ.get(
+    "PROMPT_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_prompt_mvtec_ago_template.txt"),
+)
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5          # seconds between retries
 BATCH_SAVE_INTERVAL = 50  # save progress every N images
 
-# DashScope error codes that indicate quota/balance exhaustion —
-# retrying the same model won't help, so we fall back to the next model.
-_QUOTA_ERROR_CODES = {
-    "Arrearage", "Throttling.RateQuota", "Throttling.AllocationQuota",
-    "QuotaExceeded", "ResourceExhausted",
-}
+# ──────────────────── OpenAI client ────────────────────
+
+def _build_client() -> OpenAI:
+    """Build an OpenAI client pointed at 百炼, with proxy explicitly disabled."""
+    api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+    import httpx
+
+    # Explicitly create an httpx client that does NOT use system proxy
+    # (SOCKS proxy often causes Connection refused errors on 百炼)
+    http_client = httpx.Client(
+        proxy=None,       # disable system proxy
+        timeout=httpx.Timeout(120.0, connect=30.0),
+    )
+    return OpenAI(
+        api_key=api_key,
+        base_url=BASE_URL,
+        http_client=http_client,
+    )
 
 # ──────────────────── Helpers ──────────────────────────
 
@@ -59,69 +82,78 @@ def load_prompt(path: str) -> str:
 
 def call_vlm(image_path: str, prompt_text: str,
              cat_name: str = "", dtype_name: str = "") -> str:
-    """Call Qwen-VL via DashScope native SDK and return the description string.
+    """Call Qwen-VL via 百炼 OpenAI-compatible API and return the description string.
 
-    Automatically falls back to cheaper models (qwen-vl-plus → qwen-vl-turbo)
-    when the current model hits quota or balance errors.
-
-    Parameters
-    ----------
-    cat_name : str
-        MVTec product category (e.g. 'bottle', 'hazelnut').
-    dtype_name : str
-        MVTec defect type (e.g. 'broken_large', 'scratch').
+    Automatically falls back to cheaper models when the current model hits
+    quota or balance errors.
     """
     b64 = encode_image_base64(image_path)
 
-    # Build user message with image + metadata so the VLM sees the labels
-    user_content = [{"image": f"data:image/png;base64,{b64}"}]
+    # Build user message content with image + metadata
+    user_content = [
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"},
+        },
+    ]
     if cat_name or dtype_name:
         meta_parts = []
         if cat_name:
             meta_parts.append(f"product_category: {cat_name}")
         if dtype_name:
             meta_parts.append(f"defect_type: {dtype_name}")
-        meta_text = "Known metadata (use these exact labels when consistent with the image): " + "; ".join(meta_parts)
-        user_content.append({"text": meta_text})
+        meta_text = (
+            "Known metadata (use these exact labels when consistent with the image): "
+            + "; ".join(meta_parts)
+        )
+        user_content.append({"type": "text", "text": meta_text})
 
+    client = _build_client()
     last_error = None
-    for model_idx, model_name in enumerate(MODEL_FALLBACK):
+
+    for model_name in MODEL_FALLBACK:
         for attempt in range(MAX_RETRIES):
             try:
-                resp = MultiModalConversation.call(
+                resp = client.chat.completions.create(
                     model=model_name,
                     messages=[
-                        {"role": "system", "content": [{"text": prompt_text}]},
-                        {
-                            "role": "user",
-                            "content": user_content,
-                        },
+                        {"role": "system", "content": prompt_text},
+                        {"role": "user", "content": user_content},
                     ],
+                    temperature=0.1,
+                    max_tokens=2048,
                 )
-                if resp.status_code == 200:
-                    return resp.output.choices[0].message.content[0]["text"].strip()
-                else:
-                    raise RuntimeError(
-                        f"DashScope error {resp.status_code}: {resp.code} - {resp.message}"
-                    )
+                return resp.choices[0].message.content.strip()
+
             except Exception as e:
                 last_error = e
-                # Extract error code for quota detection
-                code = ""
-                try:
-                    code = resp.code
-                except (NameError, AttributeError):
-                    pass
-                # Quota exhausted → don't retry this model, fall back
-                if code in _QUOTA_ERROR_CODES:
+                msg = str(e)
+
+                # Detect quota/balance errors → don't retry, fall back
+                if _is_quota_error(msg):
                     tqdm.write(f"  [quota] {model_name} exhausted, falling back...")
                     break
+
                 if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    delay = RETRY_DELAY * (attempt + 1)
+                    tqdm.write(f"  [retry] {model_name} attempt {attempt+1}/{MAX_RETRIES}, "
+                               f"waiting {delay}s: {msg[:120]}")
+                    time.sleep(delay)
 
     raise RuntimeError(
         f"Failed after all models {MODEL_FALLBACK}: {last_error}"
     ) from last_error
+
+
+def _is_quota_error(msg: str) -> bool:
+    """Detect quota/balance exhaustion from error message text."""
+    quota_keywords = [
+        "Arrearage", "Throttling", "QuotaExceeded", "ResourceExhausted",
+        "quota", "insufficient", "balance", "arrears", "AccountArrears",
+        "out of quota", "rate limit", "limit exceeded",
+    ]
+    msg_lower = msg.lower()
+    return any(kw.lower() in msg_lower for kw in quota_keywords)
 
 
 # ──────────────────── Resume support ──────────────────
@@ -130,7 +162,20 @@ def load_progress(output_file: str):
     """Load previously saved JSON so we can skip already-described images."""
     if os.path.exists(output_file):
         with open(output_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            # Filter out error entries so they get retried
+            good = [a for a in data.get("annotations", [])
+                    if not a["description"].startswith("[ERROR]")]
+            good_filenames = {
+                img["file_name"]
+                for img in data.get("images", [])
+                if img["id"] in {a["image_id"] for a in good}
+            }
+            # Remove failed entries so they'll be reprocessed
+            data["images"] = [img for img in data["images"]
+                              if img["file_name"] in good_filenames]
+            data["annotations"] = good
+            return data
     return None
 
 
@@ -152,19 +197,21 @@ def main():
         print("  CMD:       set DASHSCOPE_API_KEY=sk-xxxxxxxxxxxx")
         print("  PowerShell: $env:DASHSCOPE_API_KEY='sk-xxxxxxxxxxxx'")
         sys.exit(1)
-    dashscope.api_key = api_key
     print(f"API Key loaded (sk-...{api_key[-6:]})")
+    print(f"Base URL: {BASE_URL}")
+    print(f"MVTec root: {MVTEC_ROOT}")
 
     prompt_text = load_prompt(PROMPT_FILE)
 
     # Resume or initialise
     coco = load_progress(OUTPUT_FILE)
     if coco is not None:
-        print(f"[resume] Loaded existing JSON with {len(coco['images'])} images.")
+        print(f"[resume] Loaded existing JSON with {len(coco['images'])} valid images "
+              f"(failed entries discarded for retry).")
     else:
         coco = {
             "info": {
-                "description": "MVTec AD defect image descriptions generated by Qwen-VL",
+                "description": "MVTec AD defect image descriptions generated by Qwen-VL (百炼 OpenAI API)",
                 "version": "1.0",
                 "year": 2026,
                 "date_created": datetime.now().isoformat(),
@@ -189,7 +236,7 @@ def main():
         cat_id = next_cat_id
         next_cat_id += 1
         cat_id_map[cat_name] = cat_id
-        coco["categories"].append({
+        coco.setdefault("categories", []).append({
             "id": cat_id,
             "name": cat_name,
             "supercategory": "industrial_product",
@@ -204,7 +251,7 @@ def main():
             if key not in dtype_id_map:
                 dtype_id_map[key] = next_dtype_id
                 next_dtype_id += 1
-                coco["defect_types"].append({
+                coco.setdefault("defect_types", []).append({
                     "id": dtype_id_map[key],
                     "name": dtype_name,
                     "category_id": cat_id,
@@ -228,8 +275,8 @@ def main():
                     continue
                 all_images.append((cat_name, dtype_name, fname))
 
-    # Determine which images are already processed (for resume)
-    done_filenames = {img["file_name"] for img in coco["images"]}
+    # Determine which images need processing
+    done_filenames = {img["file_name"] for img in coco.get("images", [])}
     todo = [
         (cat, dtype, fname)
         for cat, dtype, fname in all_images
@@ -237,13 +284,13 @@ def main():
     ]
 
     print(f"Total defect images : {len(all_images)}")
-    print(f"Already processed : {len(done_filenames)}")
-    print(f"Remaining         : {len(todo)}")
-    print(f"Model             : {MODEL}")
+    print(f"Already processed   : {len(done_filenames)}")
+    print(f"Remaining           : {len(todo)}")
+    print(f"Model fallback chain: {MODEL_FALLBACK}")
     print()
 
-    next_img_id = max([img["id"] for img in coco["images"]], default=0) + 1
-    next_ann_id = max([ann["id"] for ann in coco["annotations"]], default=0) + 1
+    next_img_id = max([img["id"] for img in coco.get("images", [])], default=0) + 1
+    next_ann_id = max([ann["id"] for ann in coco.get("annotations", [])], default=0) + 1
 
     processed_in_batch = 0
     pbar = tqdm(total=len(todo), desc="Describing images", unit="img")
@@ -281,7 +328,7 @@ def main():
             "category_id": cat_id_map[cat_name],
             "defect_type_id": dtype_id_map[f"{cat_name}/{dtype_name}"],
             "description": description,
-            "source_model": MODEL,
+            "source_model": "openai-compat",
         })
 
         processed_in_batch += 1
